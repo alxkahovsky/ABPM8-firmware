@@ -2,109 +2,82 @@
   Ротатор для лайв сонара на Arduino Nano
   Управление: NEMA 23 + TMC2160 + BMI160 IMU
 
-
-  РЕЖИМЫ (кнопки-переключатели, нажал-отпустил = вкл/выкл):
-  - A2: Стабилизация курса (компенсация поворотов лодки по данным гироскопа)
-  - A3: Силовое удержание вала (мотор просто заблокирован, без коррекции)
-  - A0/A1: Педали ручного поворота — РАБОТАЮТ В ЛЮБОМ РЕЖИМЕ
-           В режиме стабилизации после поворота педалями база автоматически
-           обновляется, и компенсация продолжается от новой точки.
-
-  КАЛИБРОВКА:
-  - Автоматически при каждом включении питания
-  - Светодиод питания быстро мигает = "Держите лодку неподвижно!"
+  ИСПРАВЛЕНИЕ: stepper.autoPower(false) в режиме Hold,
+  чтобы библиотека не отключала мотор автоматически.
 */
 
-#include "GyverStepper.h" // https://github.com/GyverLibs/GyverStepper
-#include <BMI160Gen.h>    // https://github.com/hanyazou/BMI160-Arduino
-#include "MadgwickAHRS.h" // Фильтр ориентации (кватернион -> угол)
-#include "GyverFilters.h" // Медианные фильтры
-#include <SPI.h>
+#include "GyverStepper.h" 
+#include <EEPROM.h>       
+#include <BMI160Gen.h>    
+#include "MadgwickAHRS.h" 
+#include "GyverFilters.h" 
+#include <Wire.h>
 
 //////////////////// СЕКЦИЯ НАСТРОЕК ////////////////////////
 
-// --- Пины кнопок и педалей ---
-#define PIN_BTN_RIGHT  A0   // Педаль: поворот датчика вправо (работает всегда)
-#define PIN_BTN_LEFT   A1   // Педаль: поворот датчика влево  (работает всегда)
-#define PIN_BTN_STAB   A2   // Переключатель: Стабилизация курса
-#define PIN_BTN_HOLD   A3   // Переключатель: Силовое удержание вала
-#define PIN_POT_SPEED  A7   // Потенциометр скорости вращения
+#define RightButton  A0   
+#define LeftButton   A1   
+#define StabButton   A2   
+#define HoldButton   A3   
+#define SpeedPotPin  A7   
 
-// --- Пины светодиодов ---
-#define PIN_LED_POWER  A5   // LED 1: Питание / Статус калибровки
-#define PIN_LED_STAB   A4   // LED 2: Активен режим стабилизации курса
-#define PIN_LED_HOLD   A6   // LED 3: Активен режим силового удержания
+#define LedPower     A5    // D3 - питание
+#define LedStab      A4    // D4 - стабилизация
+#define LedHold      4    // D5 - удержание
 
-// --- Пины драйвера шагового двигателя TMC2160 ---
-#define PIN_STEP       6    // CLK
-#define PIN_DIR        7    // DIR
-#define PIN_EN         8    // EN
+#define StepPin      6    
+#define DirPin       7    
+#define EnablePin    8    
 
-// --- Параметры мотора ---
-#define MICROSTEPS     6400   // Импульсов на оборот (MRES=32: M0-OFF, M1-ON)
-#define GEAR_RATIO     1      // Передаточное число редуктора
-#define MOTOR_DIR      1      // 1 или -1 (поменяйте, если компенсация крутит не в ту сторону)
-#define ANGLE_TO_STEP  17.78f  // 6400 / 360 = 17.78 шагов на градус
+#define MicroStep      6400   
+#define GearRatio      1      
+#define MotorDirection 1      
+#define AngleToStep    17.78f 
 
-// --- Настройки стабилизации ---
-#define NEUTRAL_ZONE     0.8f  // Мертвая зона в градусах
-#define UPDATE_THRESHOLD 10    // Мин. изменение цели в шагах для отправки команды (~0.56°)
-                               // ГЛАВНАЯ защита от микро-дерганий!
-#define SPEED_MIN        50    // Мин. скорость (шаг/сек)
-#define SPEED_MAX        1600  // Макс. скорость (шаг/сек)
-#define ACCELERATION     0     // Ускорение (0 = мгновенный отклик)
+#define NeutralZone     0.8f  
+#define UpdateThreshold 10    
+#define SpeedMin        50    
+#define SpeedMax        1600  
+#define Acceleration    0     
 
-// --- Настройки IMU ---
-#define IMU_WARMUP_MS    3000  // Время прогрева фильтра Маджвика после калибровки
+#define TO_RAD       0.01745329252f
+#define imuPeriod    20       
 
 //////////////////// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ////////////////////////
 
-GStepper<STEPPER2WIRE> stepper(MICROSTEPS, PIN_STEP, PIN_DIR, PIN_EN);
-Madgwick madgwickFilter;
+GStepper<STEPPER2WIRE> stepper(MicroStep, StepPin, DirPin, EnablePin);
 
-// Медианные фильтры для подавления выбросов IMU
 GMedian3<int> filterAxelX, filterAxelY, filterAxelZ;
 GMedian3<int> filterGyroX, filterGyroY, filterGyroZ;
 
-// Состояния системы
-bool stabMode = false;       // Режим стабилизации курса
-bool holdMode = false;       // Режим силового удержания вала
-bool imuReady = false;       // Фильтр Маджвика прогрелся
-bool imuConnected = false;   // IMU физически подключен
-bool pedalActive = false;    // Педаль нажата ИЛИ мотор ещё крутится после неё
-bool needBaseUpdate = false; // Нужно обновить базу после отпускания педали
+bool StabMode = false;       
+bool HoldMode = false;       
+bool IMU_Enable = false;     
+bool pedalActive = false;    
+bool needBaseUpdate = false; 
 
-// Данные стабилизации
-float baseYaw = 0.0f;        // Курс лодки в момент включения стабилизации / обновления базы
-float currentYaw = 0.0f;     // Текущий курс лодки по гироскопу
-long baseMotorPos = 0;       // Позиция мотора в момент включения стабилизации / обновления базы
-long lastSetTarget = 0;      // Последняя отправленная мотору целевая позиция
+float BaseYaw = 0.0f;        
+float CurrentYaw = 0.0f;     
+long BaseMotorPos = 0;       
+long LastSetTarget = 0;      
 
-// Таймеры
-uint32_t imuTimer = 0;
+float tdelta;
+int aix, aiy, aiz;
+int gix, giy, giz;
+float imu[3];
+float quat[4];
+uint32_t imu_t = 0;
+
 uint32_t btnStabTimer = 0;
 uint32_t btnHoldTimer = 0;
-uint32_t startupTime = 0;
-
-// Debounce состояния кнопок
-bool lastBtnStabState = HIGH;
-bool lastBtnHoldState = HIGH;
-bool lastBtnRightState = HIGH;
-bool lastBtnLeftState = HIGH;
+uint32_t pedalReleaseTime = 0; 
+bool lastStabState = HIGH;
+bool lastHoldState = HIGH;
+bool lastRightState = HIGH;
+bool lastLeftState = HIGH;
 
 //////////////////// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ////////////////////////
 
-// Извлечение угла Yaw (курс) из кватернионов фильтра Маджвика (0...360°)
-float getYawFromQuat(float q0, float q1, float q2, float q3) {
-    float yaw = atan2(2.0f * (q0 * q3 + q1 * q2),
-                      1.0f - 2.0f * (q2 * q2 + q3 * q3));
-    float deg = yaw * 57.2957795f;
-    if (deg < 0.0f) deg += 360.0f;
-    return deg;
-}
-
-// Кратчайшая разница между двумя углами (с учётом перехода через 0°/360°)
-// Возвращает значение в диапазоне [-180, +180]
 float getAngleDiff(float base, float current) {
     float diff = current - base;
     while (diff > 180.0f)  diff -= 360.0f;
@@ -112,27 +85,42 @@ float getAngleDiff(float base, float current) {
     return diff;
 }
 
+// Тестовое мигание всех светодиодов
+void testLeds() {
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LedPower, HIGH); delay(150); digitalWrite(LedPower, LOW);
+        digitalWrite(LedStab, HIGH);  delay(150); digitalWrite(LedStab, LOW);
+        digitalWrite(LedHold, HIGH);  delay(150); digitalWrite(LedHold, LOW);
+    }
+}
+
+//////////////////// SETUP ////////////////////////
 
 void setup() {
     Serial.begin(115200);
-    startupTime = millis();
+    delay(500);
 
-    pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
-    pinMode(PIN_BTN_LEFT,  INPUT_PULLUP);
-    pinMode(PIN_BTN_STAB,  INPUT_PULLUP);
-    pinMode(PIN_BTN_HOLD,  INPUT_PULLUP);
-    pinMode(PIN_LED_POWER, OUTPUT);
-    pinMode(PIN_LED_STAB,  OUTPUT);
-    pinMode(PIN_LED_HOLD,  OUTPUT);
+    pinMode(RightButton, INPUT_PULLUP);
+    pinMode(LeftButton,  INPUT_PULLUP);
+    pinMode(StabButton,  INPUT_PULLUP);
+    pinMode(HoldButton,  INPUT_PULLUP);
+    
+    pinMode(LedPower, OUTPUT);
+    pinMode(LedStab,  OUTPUT);
+    pinMode(LedHold,  OUTPUT);
+
+    // Тест светодиодов: все 3 должны мигнуть по очереди 3 раза
+    Serial.println(F("Testing LEDs..."));
+    testLeds();
 
     stepper.autoPower(true);
-    stepper.setAcceleration(ACCELERATION * GEAR_RATIO);
-    stepper.setMaxSpeed(SPEED_MAX * GEAR_RATIO);
+    stepper.setAcceleration(Acceleration * GearRatio);
+    stepper.setMaxSpeed(SpeedMax * GearRatio);
     stepper.disable();
 
-    Serial.println(F("IMU init..."));
+    Serial.println(F("IMU initialization..."));
     if (BMI160.begin(BMI160GenClass::SPI_MODE, 10)) {
-        imuConnected = true;
+        IMU_Enable = true;
         BMI160.setGyroRate(50);
         BMI160.setAccelerometerRate(50);
         BMI160.setAccelDLPFMode(1);
@@ -140,13 +128,10 @@ void setup() {
         BMI160.setAccelerometerRange(2);
         BMI160.setGyroRange(250);
 
-        // =============================================
-        //  АВТОМАТИЧЕСКАЯ КАЛИБРОВКА ПРИ ВКЛЮЧЕНИИ
-        // =============================================
         for (int i = 0; i < 15; i++) {
-            digitalWrite(PIN_LED_POWER, HIGH);
+            digitalWrite(LedPower, HIGH);
             delay(35);
-            digitalWrite(PIN_LED_POWER, LOW);
+            digitalWrite(LedPower, LOW);
             delay(35);
         }
 
@@ -157,201 +142,191 @@ void setup() {
         BMI160.autoCalibrateAccelerometerOffset(Y_AXIS, 0);
         BMI160.autoCalibrateAccelerometerOffset(Z_AXIS, 1);
 
-        digitalWrite(PIN_LED_POWER, HIGH);
-        delay(600);
-        digitalWrite(PIN_LED_POWER, LOW);
+        EEPROM.put(36, BMI160.getAccelerometerOffset(X_AXIS));
+        EEPROM.put(40, BMI160.getAccelerometerOffset(Y_AXIS));
+        EEPROM.put(44, BMI160.getAccelerometerOffset(Z_AXIS));
+        EEPROM.put(48, BMI160.getGyroOffset(X_AXIS));
+        EEPROM.put(52, BMI160.getGyroOffset(Y_AXIS));
+        EEPROM.put(56, BMI160.getGyroOffset(Z_AXIS));
 
-        madgwickFilter.begin(50.0f);
-        Serial.println(F("Calibration done. Warming up filter..."));
+        digitalWrite(LedPower, HIGH);
+        delay(600);
+        digitalWrite(LedPower, LOW);
+        
+        Serial.println(F("Calibration done. System ready."));
 
     } else {
         Serial.println(F("!!! IMU NOT FOUND !!!"));
         while (true) {
-            digitalWrite(PIN_LED_POWER, HIGH);
+            digitalWrite(LedPower, HIGH);
             delay(300);
-            digitalWrite(PIN_LED_POWER, LOW);
+            digitalWrite(LedPower, LOW);
             delay(300);
         }
     }
 }
 
+//////////////////// LOOP ////////////////////////
 
 void loop() {
     stepper.tick();
 
+    // --- Потенциометр скорости ---
     static uint32_t potTimer = 0;
     if (millis() - potTimer > 100) {
         potTimer = millis();
-        int potVal = analogRead(PIN_POT_SPEED);
-        long spd = map(potVal, 0, 1023, SPEED_MIN, SPEED_MAX) * GEAR_RATIO;
+        int SpeedPotValue = analogRead(SpeedPotPin);
+        long spd = map(SpeedPotValue, 0, 1023, SpeedMin, SpeedMax) * GearRatio;
         stepper.setMaxSpeed(spd);
     }
 
-    if (imuConnected && (millis() - imuTimer > 20)) {
-        imuTimer = millis();
-
-        int aix, aiy, aiz, gix, giy, giz;
+    // --- Чтение IMU ---
+    if (IMU_Enable && (millis() - imu_t > imuPeriod)) {
+        tdelta = (millis() - imu_t) / 1000.0f;
+        imu_t = millis();
+        
         BMI160.readMotionSensor(aix, aiy, aiz, gix, giy, giz);
 
-        float gx = filterGyroX.filtered(gix) * 0.01745329252f / 131.0f;
-        float gy = filterGyroY.filtered(giy) * 0.01745329252f / 131.0f;
-        float gz = filterGyroZ.filtered(giz) * 0.01745329252f / 131.0f;
-        float ax = filterAxelX.filtered(aix);
-        float ay = filterAxelY.filtered(aiy);
-        float az = filterAxelZ.filtered(aiz);
+        float gx_mpu = filterGyroX.filtered(gix) * TO_RAD / 131.0;
+        float gy_mpu = filterGyroY.filtered(giy) * TO_RAD / 131.0;
+        float gz_mpu = filterGyroZ.filtered(giz) * TO_RAD / 131.0;
+        float ax_mpu = filterAxelX.filtered(aix);
+        float ay_mpu = filterAxelY.filtered(aiy);
+        float az_mpu = filterAxelZ.filtered(aiz);
 
-        madgwickFilter.update(gx, gy, gz, ax, ay, az);
-        currentYaw = getYawFromQuat(madgwickFilter.q0, madgwickFilter.q1,
-                                     madgwickFilter.q2, madgwickFilter.q3);
-
-        if (!imuReady && (millis() - startupTime > IMU_WARMUP_MS)) {
-            imuReady = true;
-            Serial.println(F("IMU ready."));
-        }
+        MadgwickAHRSupdateIMU(tdelta, gx_mpu, gy_mpu, gz_mpu, ax_mpu, ay_mpu, az_mpu);
+        quat[0] = q0; quat[1] = q1; quat[2] = q2; quat[3] = q3;
+        quat2Euler(&quat[0], &imu[0]);
+        CurrentYaw = imu[2] / TO_RAD;
     }
 
-    bool curStab = digitalRead(PIN_BTN_STAB);
-    if (curStab == LOW && lastBtnStabState == HIGH && (millis() - btnStabTimer > 50)) {
+    // --- СТАБИЛИЗАЦИЯ (A2) ---
+    bool curStab = digitalRead(StabButton);
+    if (curStab == LOW && lastStabState == HIGH && (millis() - btnStabTimer > 50)) {
         btnStabTimer = millis();
+        StabMode = !StabMode;
 
-        if (imuReady) {
-            stabMode = !stabMode;
-
-            if (stabMode) {
-                holdMode = false;
-
-                // Усредняем курс лодки за 100мс (5 замеров × 20мс)
-                float yawSum = 0.0f;
-                for (int i = 0; i < 5; i++) {
-                    yawSum += currentYaw;
-                    delay(20);
-                }
-                baseYaw = yawSum / 5.0f;
-                baseMotorPos = stepper.getCurrent();
-                lastSetTarget = baseMotorPos;
-
-                stepper.setTarget(baseMotorPos, ABSOLUTE);
-                stepper.enable();
-
-                Serial.print(F("Stab ON. BaseYaw="));
-                Serial.print(baseYaw);
-                Serial.print(F(" BasePos="));
-                Serial.println(baseMotorPos);
-            } else {
-                stepper.brake();
-                stepper.disable();
-                Serial.println(F("Stab OFF"));
+        if (StabMode) {
+            HoldMode = false;
+            digitalWrite(LedHold, LOW);
+            stepper.autoPower(true); // В режиме стабилизации autoPower можно оставить
+            
+            float yawSum = 0.0f;
+            for (int i = 0; i < 5; i++) {
+                yawSum += CurrentYaw;
+                delay(20);
             }
+            BaseYaw = yawSum / 5.0f;
+            BaseMotorPos = stepper.getCurrent();
+            LastSetTarget = BaseMotorPos;
+
+            stepper.setTarget(BaseMotorPos, ABSOLUTE);
+            stepper.enable();
+            Serial.print(F("Stab ON. Yaw=")); Serial.print(BaseYaw);
+            Serial.print(F(" Pos=")); Serial.println(BaseMotorPos);
         } else {
-            // IMU не прогрелся — коротко мигаем LED_STAB
-            for (int i = 0; i < 3; i++) {
-                digitalWrite(PIN_LED_STAB, HIGH);
-                delay(80);
-                digitalWrite(PIN_LED_STAB, LOW);
-                delay(80);
-            }
+            stepper.brake();
+            stepper.disable();
+            Serial.println(F("Stab OFF"));
         }
     }
-    lastBtnStabState = curStab;
+    lastStabState = curStab;
 
-    bool curHold = digitalRead(PIN_BTN_HOLD);
-    if (curHold == LOW && lastBtnHoldState == HIGH && (millis() - btnHoldTimer > 50)) {
+    // --- СИЛОВОЕ УДЕРЖАНИЕ (A3) ---
+    bool curHold = digitalRead(HoldButton);
+    if (curHold == LOW && lastHoldState == HIGH && (millis() - btnHoldTimer > 50)) {
         btnHoldTimer = millis();
-        holdMode = !holdMode;
+        HoldMode = !HoldMode;
 
-        if (holdMode) {
-            stabMode = false;
+        if (HoldMode) {
+            StabMode = false;
+            digitalWrite(LedStab, LOW);
+            
+            // ★ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ★
+            // Отключаем autoPower, иначе tick() мгновенно отключит мотор,
+            // потому что цель == текущая позиция и библиотека решит,
+            // что "мотор на месте, можно выключить"
+            stepper.autoPower(false);
             stepper.enable();
-            stepper.brake();
-            Serial.println(F("Hold ON"));
+            stepper.setTarget(stepper.getCurrent(), ABSOLUTE);
+            
+            Serial.print(F("Hold ON. Pos="));
+            Serial.println(stepper.getCurrent());
         } else {
+            // Возвращаем autoPower для нормальных режимов
+            stepper.autoPower(true);
             stepper.disable();
             Serial.println(F("Hold OFF"));
         }
     }
-    lastBtnHoldState = curHold;
+    lastHoldState = curHold;
 
-    bool curRight = digitalRead(PIN_BTN_RIGHT);
-    bool curLeft  = digitalRead(PIN_BTN_LEFT);
+    // --- ПЕДАЛИ (A0/A1) ---
+    bool curRight = digitalRead(RightButton);
+    bool curLeft  = digitalRead(LeftButton);
 
-    // --- Фронт нажатия любой педали ---
-    bool rightPressed = (curRight == LOW && lastBtnRightState == HIGH);
-    bool leftPressed  = (curLeft  == LOW && lastBtnLeftState  == HIGH);
+    bool rightPressed = (curRight == LOW && lastRightState == HIGH);
+    bool leftPressed  = (curLeft  == LOW && lastLeftState  == HIGH);
 
     if (rightPressed || leftPressed) {
-        pedalActive = true;       // Приостанавливаем компенсацию на время поворота
-        needBaseUpdate = false;   // Сбрасываем старый запрос на обновление базы
+        pedalActive = true;       
+        needBaseUpdate = false;   
+        stepper.autoPower(true); // Педали работают с autoPower
         stepper.enable();
 
         if (rightPressed) {
-            // Крутим на 1 оборот вправо (RELATIVE)
-            stepper.setTarget(-1L * 360L * (long)MICROSTEPS / GEAR_RATIO, RELATIVE);
+            stepper.setTarget(-1L * 360L * (long)MicroStep / GearRatio, RELATIVE);
         }
         if (leftPressed) {
-            // Крутим на 1 оборот влево (RELATIVE)
-            stepper.setTarget(1L * 360L * (long)MICROSTEPS / GEAR_RATIO, RELATIVE);
+            stepper.setTarget(1L * 360L * (long)MicroStep / GearRatio, RELATIVE);
         }
     }
 
-    // --- Фронт отпускания педали ---
-    bool rightReleased = (curRight == HIGH && lastBtnRightState == LOW);
-    bool leftReleased  = (curLeft  == HIGH && lastBtnLeftState  == LOW);
+    bool rightReleased = (curRight == HIGH && lastRightState == LOW);
+    bool leftReleased  = (curLeft  == HIGH && lastLeftState  == LOW);
 
     if (rightReleased || leftReleased) {
-        stepper.brake();          // Плавно останавливаем мотор
-        needBaseUpdate = true;    // Запрашиваем обновление базы после остановки
+        stepper.brake();          
+        needBaseUpdate = true;    
+        pedalReleaseTime = millis(); 
     }
 
-    lastBtnRightState = curRight;
-    lastBtnLeftState  = curLeft;
+    lastRightState = curRight;
+    lastLeftState  = curLeft;
 
-    // --- Обновление базы после остановки мотора ---
-    // Ждём, пока мотор действительно остановится, и только потом фиксируем новую точку
-    if (needBaseUpdate && stepper.getState() == STEPPER_STOP) {
-        if (stabMode) {
-            // В режиме стабилизации: обновляем базу, чтобы компенсация
-            // продолжалась уже от НОВОГО направления датчика
-            baseMotorPos = stepper.getCurrent();
-            // Усредняем текущий курс лодки для плавности
+    // --- ОБНОВЛЕНИЕ БАЗЫ ПОСЛЕ ПЕДАЛИ ---
+    if (needBaseUpdate && (millis() - pedalReleaseTime > 300)) {
+        if (StabMode) {
+            BaseMotorPos = stepper.getCurrent();
             float yawSum = 0.0f;
             for (int i = 0; i < 3; i++) {
-                yawSum += currentYaw;
+                yawSum += CurrentYaw;
                 delay(20);
             }
-            baseYaw = yawSum / 3.0f;
-            lastSetTarget = baseMotorPos;
-
-            Serial.print(F("Base updated. Yaw="));
-            Serial.print(baseYaw);
-            Serial.print(F(" Pos="));
-            Serial.println(baseMotorPos);
+            BaseYaw = yawSum / 3.0f;
+            LastSetTarget = BaseMotorPos;
+            Serial.print(F("Base updated. Yaw=")); Serial.print(BaseYaw);
+            Serial.print(F(" Pos=")); Serial.println(BaseMotorPos);
         }
-        // В режиме силового удержания или свободном режиме — просто держим текущую позицию
         needBaseUpdate = false;
-    }
-
-    // --- Сброс флага pedalActive, когда педаль отпущена и мотор остановился ---
-    if (pedalActive && curRight == HIGH && curLeft == HIGH &&
-        stepper.getState() == STEPPER_STOP) {
         pedalActive = false;
     }
 
-    if (stabMode && imuConnected && !pedalActive) {
-        float yawDelta = getAngleDiff(baseYaw, currentYaw);
+    // --- ЯДРО СТАБИЛИЗАЦИИ ---
+    if (StabMode && IMU_Enable && !pedalActive) {
+        float yawDelta = getAngleDiff(BaseYaw, CurrentYaw);
+        long newTarget = BaseMotorPos - (long)round(yawDelta * AngleToStep * GearRatio) * MotorDirection;
 
-        long newTarget = baseMotorPos
-                         - (long)round(yawDelta * ANGLE_TO_STEP * GEAR_RATIO) * MOTOR_DIR;
-
-        if (abs(yawDelta) > NEUTRAL_ZONE) {
-            if (abs(newTarget - lastSetTarget) > UPDATE_THRESHOLD) {
+        if (abs(yawDelta) > NeutralZone) {
+            if (abs(newTarget - LastSetTarget) > UpdateThreshold) {
                 stepper.setTarget(newTarget, ABSOLUTE);
-                lastSetTarget = newTarget;
+                LastSetTarget = newTarget;
             }
         }
     }
 
-
-    digitalWrite(PIN_LED_POWER, HIGH);                  // Питание: горит всегда
-    digitalWrite(PIN_LED_STAB,  stabMode ? HIGH : LOW); // Стабилизация
-    digitalWrite(PIN_LED_HOLD,  holdMode ? HIGH : LOW); // Силовое удержание
+    // --- СВЕТОДИОДЫ ---
+    digitalWrite(LedPower, HIGH);                  
+    digitalWrite(LedStab,  StabMode ? HIGH : LOW); 
+    digitalWrite(LedHold,  HoldMode ? HIGH : LOW); 
 }
